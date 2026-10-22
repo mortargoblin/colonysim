@@ -11,11 +11,14 @@ import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.ViewConfiguration
 import com.colonysim.core.Colony
+import com.colonysim.core.Crop
 import com.colonysim.core.Feature
 import com.colonysim.core.JobType
 import com.colonysim.core.Pawn
 import com.colonysim.core.Pos
+import com.colonysim.core.Room
 import com.colonysim.core.Terrain
+import com.colonysim.core.Tile
 import com.colonysim.core.Tool
 import kotlin.math.abs
 import kotlin.math.floor
@@ -37,7 +40,7 @@ class ColonyView(context: Context) : View(context) {
             centerCamera()
         }
     var listener: Listener? = null
-    var tool: Tool = Tool.INSPECT
+    var tool: Tool = Tool.Inspect
     var paused = false
     var speed = 1
 
@@ -175,7 +178,7 @@ class ColonyView(context: Context) : View(context) {
                 downY = e.y
                 lastFocusX = e.x
                 lastFocusY = e.y
-                if (tool != Tool.INSPECT) paint(c, e.x, e.y)
+                if (tool != Tool.Inspect) paint(c, e.x, e.y)
             }
             MotionEvent.ACTION_POINTER_DOWN, MotionEvent.ACTION_POINTER_UP -> {
                 multiTouch = true
@@ -185,7 +188,7 @@ class ColonyView(context: Context) : View(context) {
             }
             MotionEvent.ACTION_MOVE -> {
                 if (hypot(e.x - downX, e.y - downY) > touchSlop) movedFar = true
-                if (tool != Tool.INSPECT && !multiTouch) {
+                if (tool != Tool.Inspect && !multiTouch) {
                     paint(c, e.x, e.y)
                 } else if (movedFar || multiTouch) {
                     val (fx, fy) = focus(e)
@@ -197,7 +200,7 @@ class ColonyView(context: Context) : View(context) {
                 }
             }
             MotionEvent.ACTION_UP -> {
-                if (tool == Tool.INSPECT && !multiTouch && !movedFar) select(c, e.x, e.y)
+                if (tool == Tool.Inspect && !multiTouch && !movedFar) select(c, e.x, e.y)
                 if (paintedAny) listener?.onSelectionChanged()
             }
         }
@@ -233,6 +236,18 @@ class ColonyView(context: Context) : View(context) {
         selectedTile = null
     }
 
+    /** Selects a colonist and scrolls the camera to them. */
+    fun selectPawn(id: Int) {
+        val p = colony?.pawns?.firstOrNull { it.id == id } ?: return
+        selectedPawnId = id
+        selectedTile = null
+        offsetX = width / 2f - (p.x + 0.5f) * tileSize
+        offsetY = height / 2f - (p.y + 0.5f) * tileSize
+        clampCamera()
+        listener?.onSelectionChanged()
+        invalidate()
+    }
+
     // ------------------------------------------------------------ drawing
 
     private val fill = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -253,11 +268,19 @@ class ColonyView(context: Context) : View(context) {
         val y1 = floor((height - offsetY) / ts).toInt().coerceAtMost(c.height - 1)
 
         for (y in y0..y1) for (x in x0..x1) {
-            val left = offsetX + x * ts
-            val top = offsetY + y * ts
-            drawTile(canvas, c, x, y, left, top, ts)
+            drawTile(canvas, c.tile(x, y), x, y, offsetX + x * ts, offsetY + y * ts, ts)
         }
 
+        // Tint the room the selected tile belongs to, so enclosures are easy to check.
+        val selectedRoom: Room? = selectedTile?.let { c.roomAt(it.x, it.y) }?.takeIf { it.indoors }
+        if (selectedRoom != null) {
+            fill.color = 0x3348C9FF
+            for (y in y0..y1) for (x in x0..x1) {
+                if (c.roomAt(x, y) === selectedRoom) {
+                    canvas.drawRect(offsetX + x * ts, offsetY + y * ts, offsetX + (x + 1) * ts, offsetY + (y + 1) * ts, fill)
+                }
+            }
+        }
         selectedTile?.let {
             stroke.color = Color.WHITE
             stroke.strokeWidth = 2.5f * density
@@ -268,7 +291,17 @@ class ColonyView(context: Context) : View(context) {
         for (p in c.pawns) drawPawn(canvas, p, frac, ts)
 
         val dark = c.darkness
-        if (dark > 0f) canvas.drawColor(Color.argb((dark * 110).toInt(), 10, 20, 60))
+        if (dark > 0f) {
+            canvas.drawColor(Color.argb((dark * 110).toInt(), 10, 20, 60))
+            // Firelight.
+            fill.color = Color.argb((dark * 70).toInt(), 255, 170, 70)
+            for (y in y0..y1) for (x in x0..x1) {
+                val f = c.tile(x, y).feature
+                if (f == Feature.CAMPFIRE || f == Feature.STOVE) {
+                    canvas.drawCircle(offsetX + (x + 0.5f) * ts, offsetY + (y + 0.5f) * ts, ts * 2.5f, fill)
+                }
+            }
+        }
 
         // Selected pawn's ring stays visible through the night tint.
         c.pawns.firstOrNull { it.id == selectedPawnId }?.let { p ->
@@ -279,18 +312,63 @@ class ColonyView(context: Context) : View(context) {
         }
     }
 
-    private fun drawTile(canvas: Canvas, c: Colony, x: Int, y: Int, l: Float, t: Float, ts: Float) {
-        val tile = c.tile(x, y)
-        val checker = (x + y) % 2 == 0
-        fill.color = when (tile.terrain) {
+    private fun drawTile(canvas: Canvas, tile: Tile, x: Int, y: Int, l: Float, t: Float, ts: Float) {
+        drawTerrain(canvas, tile.terrain, (x + y) % 2 == 0, l, t, ts)
+        if (tile.feature != Feature.NONE) {
+            val doorOpen = tile.feature == Feature.DOOR && colony?.pawnAt(x, y) != null
+            drawFeature(canvas, tile.feature, tile, l, t, ts, doorOpen)
+        }
+
+        val d = tile.designation ?: return
+        val blueprint = tile.blueprint
+        if (d == JobType.BUILD && blueprint != null) {
+            // Ghost of the thing to be built.
+            canvas.saveLayerAlpha(l, t, l + ts, t + ts, 110)
+            blueprint.floor?.let { drawTerrain(canvas, it, true, l, t, ts) }
+            blueprint.feature?.let { drawFeature(canvas, it, null, l, t, ts) }
+            canvas.restore()
+        }
+        val color = designationColor(d)
+        if (d != JobType.BUILD) {
+            fill.color = color and 0x00FFFFFF or 0x40000000
+            canvas.drawRect(l, t, l + ts, t + ts, fill)
+        }
+        stroke.color = color
+        stroke.strokeWidth = 2f * density
+        val inset = ts * 0.08f
+        canvas.drawRect(l + inset, t + inset, l + ts - inset, t + ts - inset, stroke)
+    }
+
+    private fun drawTerrain(canvas: Canvas, terrain: Terrain, checker: Boolean, l: Float, t: Float, ts: Float) {
+        fill.color = when (terrain) {
             Terrain.GRASS -> if (checker) 0xFF6A9A4A.toInt() else 0xFF659447.toInt()
             Terrain.DIRT -> if (checker) 0xFF8D6E4A.toInt() else 0xFF876946.toInt()
             Terrain.SAND -> if (checker) 0xFFD8C48A.toInt() else 0xFFD2BE84.toInt()
             Terrain.WATER -> if (checker) 0xFF3F7FBF.toInt() else 0xFF3B79B8.toInt()
+            Terrain.WOOD_FLOOR -> 0xFFB08050.toInt()
+            Terrain.STONE_FLOOR -> 0xFFA7A9AC.toInt()
         }
         canvas.drawRect(l, t, l + ts, t + ts, fill)
+        when (terrain) {
+            Terrain.WOOD_FLOOR -> {
+                fill.color = 0xFF8F643B.toInt()
+                for (i in 1..2) canvas.drawRect(l, t + ts * i / 3f - ts * 0.02f, l + ts, t + ts * i / 3f + ts * 0.02f, fill)
+            }
+            Terrain.STONE_FLOOR -> {
+                stroke.color = 0xFF85878A.toInt()
+                stroke.strokeWidth = ts * 0.04f
+                canvas.drawRect(l + ts * 0.04f, t + ts * 0.04f, l + ts * 0.5f, t + ts * 0.5f, stroke)
+                canvas.drawRect(l + ts * 0.5f, t + ts * 0.5f, l + ts * 0.96f, t + ts * 0.96f, stroke)
+            }
+            else -> {}
+        }
+    }
 
-        when (tile.feature) {
+    /** [tile] is null when drawing a blueprint ghost. */
+    private fun drawFeature(
+        canvas: Canvas, feature: Feature, tile: Tile?, l: Float, t: Float, ts: Float, doorOpen: Boolean = false,
+    ) {
+        when (feature) {
             Feature.NONE -> {}
             Feature.TREE -> {
                 fill.color = 0xFF5A3A1E.toInt()
@@ -298,22 +376,55 @@ class ColonyView(context: Context) : View(context) {
                 fill.color = 0xFF2E6B2E.toInt()
                 canvas.drawCircle(l + ts * 0.5f, t + ts * 0.42f, ts * 0.36f, fill)
             }
-            Feature.ROCK -> {
+            Feature.ROCK, Feature.ORE -> {
                 fill.color = 0xFF8A8A8A.toInt()
                 rect.set(l + ts * 0.08f, t + ts * 0.12f, l + ts * 0.92f, t + ts * 0.9f)
                 canvas.drawRoundRect(rect, ts * 0.2f, ts * 0.2f, fill)
                 fill.color = 0xFFA5A5A5.toInt()
                 rect.set(l + ts * 0.2f, t + ts * 0.2f, l + ts * 0.55f, t + ts * 0.45f)
                 canvas.drawRoundRect(rect, ts * 0.1f, ts * 0.1f, fill)
+                if (feature == Feature.ORE) {
+                    fill.color = 0xFFE08A3C.toInt()
+                    canvas.drawCircle(l + ts * 0.66f, t + ts * 0.62f, ts * 0.09f, fill)
+                    canvas.drawCircle(l + ts * 0.35f, t + ts * 0.7f, ts * 0.07f, fill)
+                    canvas.drawCircle(l + ts * 0.72f, t + ts * 0.32f, ts * 0.06f, fill)
+                }
             }
             Feature.BERRY_BUSH -> {
                 fill.color = 0xFF3F8F3F.toInt()
                 canvas.drawCircle(l + ts * 0.5f, t + ts * 0.55f, ts * 0.32f, fill)
-                if (tile.growth >= 100f) {
+                if (tile != null && tile.growth >= 100f) {
                     fill.color = 0xFFD32F2F.toInt()
                     canvas.drawCircle(l + ts * 0.38f, t + ts * 0.48f, ts * 0.07f, fill)
                     canvas.drawCircle(l + ts * 0.6f, t + ts * 0.45f, ts * 0.07f, fill)
                     canvas.drawCircle(l + ts * 0.5f, t + ts * 0.66f, ts * 0.07f, fill)
+                }
+            }
+            Feature.FIELD -> drawField(canvas, tile, l, t, ts)
+            Feature.WALL -> {
+                fill.color = 0xFF5A5A5A.toInt()
+                canvas.drawRect(l, t, l + ts, t + ts, fill)
+                fill.color = 0xFF777777.toInt()
+                canvas.drawRect(l, t, l + ts, t + ts * 0.18f, fill)
+            }
+            Feature.WOOD_WALL -> {
+                fill.color = 0xFF6D4C2E.toInt()
+                canvas.drawRect(l, t, l + ts, t + ts, fill)
+                fill.color = 0xFF56391F.toInt()
+                for (i in 1..2) canvas.drawRect(l + ts * i / 3f - ts * 0.025f, t, l + ts * i / 3f + ts * 0.025f, t + ts, fill)
+                fill.color = 0xFF8A6440.toInt()
+                canvas.drawRect(l, t, l + ts, t + ts * 0.15f, fill)
+            }
+            Feature.DOOR -> {
+                fill.color = 0xFF4A3220.toInt()
+                canvas.drawRect(l, t, l + ts, t + ts, fill)
+                fill.color = 0xFFA0703F.toInt()
+                if (doorOpen) {
+                    canvas.drawRect(l + ts * 0.08f, t + ts * 0.08f, l + ts * 0.24f, t + ts * 0.92f, fill)
+                } else {
+                    canvas.drawRect(l + ts * 0.08f, t + ts * 0.08f, l + ts * 0.92f, t + ts * 0.92f, fill)
+                    fill.color = 0xFFFFD54F.toInt()
+                    canvas.drawCircle(l + ts * 0.75f, t + ts * 0.52f, ts * 0.06f, fill)
                 }
             }
             Feature.BED -> {
@@ -325,40 +436,70 @@ class ColonyView(context: Context) : View(context) {
                 fill.color = Color.WHITE
                 canvas.drawRect(l + ts * 0.25f, t + ts * 0.14f, l + ts * 0.75f, t + ts * 0.32f, fill)
             }
-            Feature.WALL -> {
-                fill.color = 0xFF5A5A5A.toInt()
-                canvas.drawRect(l, t, l + ts, t + ts, fill)
-                fill.color = 0xFF777777.toInt()
-                canvas.drawRect(l, t, l + ts, t + ts * 0.18f, fill)
+            Feature.TABLE -> {
+                fill.color = 0xFF7A5230.toInt()
+                canvas.drawRect(l + ts * 0.15f, t + ts * 0.6f, l + ts * 0.25f, t + ts * 0.92f, fill)
+                canvas.drawRect(l + ts * 0.75f, t + ts * 0.6f, l + ts * 0.85f, t + ts * 0.92f, fill)
+                fill.color = 0xFFA87545.toInt()
+                rect.set(l + ts * 0.08f, t + ts * 0.25f, l + ts * 0.92f, t + ts * 0.65f)
+                canvas.drawRoundRect(rect, ts * 0.06f, ts * 0.06f, fill)
             }
-            Feature.FIELD -> {
-                fill.color = 0xFF6B4F33.toInt()
-                canvas.drawRect(l + ts * 0.04f, t + ts * 0.04f, l + ts * 0.96f, t + ts * 0.96f, fill)
-                val ripe = tile.growth >= 100f
-                fill.color = if (ripe) 0xFFE0C040.toInt() else 0xFF7CB342.toInt()
-                val h = ts * 0.75f * (0.15f + 0.85f * tile.growth / 100f)
-                for (i in 0..2) {
-                    val cx = l + ts * (0.22f + i * 0.28f)
-                    canvas.drawRect(cx - ts * 0.05f, t + ts * 0.9f - h, cx + ts * 0.05f, t + ts * 0.9f, fill)
-                }
+            Feature.STATUE -> {
+                fill.color = 0xFF6E6E6E.toInt()
+                canvas.drawRect(l + ts * 0.2f, t + ts * 0.75f, l + ts * 0.8f, t + ts * 0.92f, fill)
+                fill.color = 0xFFDADADA.toInt()
+                canvas.drawRect(l + ts * 0.4f, t + ts * 0.4f, l + ts * 0.6f, t + ts * 0.76f, fill)
+                canvas.drawCircle(l + ts * 0.5f, t + ts * 0.28f, ts * 0.14f, fill)
+            }
+            Feature.CAMPFIRE -> {
+                fill.color = 0xFF5A3A1E.toInt()
+                canvas.drawRect(l + ts * 0.2f, t + ts * 0.7f, l + ts * 0.8f, t + ts * 0.82f, fill)
+                fill.color = 0xFFFF7043.toInt()
+                canvas.drawCircle(l + ts * 0.5f, t + ts * 0.55f, ts * 0.2f, fill)
+                fill.color = 0xFFFFD54F.toInt()
+                canvas.drawCircle(l + ts * 0.5f, t + ts * 0.6f, ts * 0.1f, fill)
+            }
+            Feature.STOVE -> {
+                fill.color = 0xFF455A64.toInt()
+                rect.set(l + ts * 0.1f, t + ts * 0.15f, l + ts * 0.9f, t + ts * 0.9f)
+                canvas.drawRoundRect(rect, ts * 0.08f, ts * 0.08f, fill)
+                fill.color = 0xFF263238.toInt()
+                canvas.drawCircle(l + ts * 0.32f, t + ts * 0.38f, ts * 0.11f, fill)
+                canvas.drawCircle(l + ts * 0.68f, t + ts * 0.38f, ts * 0.11f, fill)
+                fill.color = 0xFFFF7043.toInt()
+                canvas.drawRect(l + ts * 0.25f, t + ts * 0.62f, l + ts * 0.75f, t + ts * 0.8f, fill)
             }
         }
+    }
 
-        tile.designation?.let { d ->
-            val color = designationColor(d)
-            fill.color = color and 0x00FFFFFF or 0x40000000
-            canvas.drawRect(l, t, l + ts, t + ts, fill)
-            stroke.color = color
-            stroke.strokeWidth = 2f * density
-            val inset = ts * 0.08f
-            canvas.drawRect(l + inset, t + inset, l + ts - inset, t + ts - inset, stroke)
+    private fun drawField(canvas: Canvas, tile: Tile?, l: Float, t: Float, ts: Float) {
+        fill.color = 0xFF6B4F33.toInt()
+        canvas.drawRect(l + ts * 0.04f, t + ts * 0.04f, l + ts * 0.96f, t + ts * 0.96f, fill)
+        val growth = tile?.growth ?: 0f
+        val ripe = growth >= 100f
+        val crop = tile?.crop ?: Crop.POTATO
+        fill.color = when (crop) {
+            Crop.POTATO -> if (ripe) 0xFFC9B458.toInt() else 0xFF7CB342.toInt()
+            Crop.CORN -> if (ripe) 0xFFF2C94C.toInt() else 0xFF8BC34A.toInt()
+            Crop.HEALROOT -> if (ripe) 0xFF4DD0C4.toInt() else 0xFF2E8B57.toInt()
+        }
+        val maxH = if (crop == Crop.CORN) 0.82f else 0.6f
+        val h = ts * maxH * (0.15f + 0.85f * growth / 100f)
+        for (i in 0..2) {
+            val cx = l + ts * (0.22f + i * 0.28f)
+            canvas.drawRect(cx - ts * 0.05f, t + ts * 0.9f - h, cx + ts * 0.05f, t + ts * 0.9f, fill)
+            if (ripe && crop == Crop.HEALROOT) {
+                fill.color = Color.WHITE
+                canvas.drawCircle(cx, t + ts * 0.9f - h, ts * 0.06f, fill)
+                fill.color = 0xFF4DD0C4.toInt()
+            }
         }
     }
 
     private fun designationColor(d: JobType): Int = when (d) {
         JobType.CHOP, JobType.MINE -> 0xFFFFA726.toInt()
         JobType.PLANT_FIELD -> 0xFF9CCC65.toInt()
-        JobType.BUILD_BED, JobType.BUILD_WALL -> 0xFF4FC3F7.toInt()
+        JobType.BUILD -> 0xFF4FC3F7.toInt()
         JobType.DEMOLISH -> 0xFFEF5350.toInt()
         else -> Color.WHITE
     }

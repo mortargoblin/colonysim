@@ -21,7 +21,8 @@ object MapGen {
             water < 0.30 -> tile.terrain = Terrain.SAND
             rock > 0.68 -> {
                 tile.terrain = Terrain.DIRT
-                tile.feature = Feature.ROCK
+                // Metal ore veins sit deep inside rock formations.
+                tile.feature = if (rock > 0.74 && detail < 0.25) Feature.ORE else Feature.ROCK
             }
             rock > 0.62 -> tile.terrain = Terrain.DIRT
         }

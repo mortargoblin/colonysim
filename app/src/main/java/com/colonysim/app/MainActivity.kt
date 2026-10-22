@@ -10,8 +10,11 @@ import android.os.Bundle
 import android.text.SpannableStringBuilder
 import android.text.Spanned
 import android.text.style.ForegroundColorSpan
+import android.text.style.RelativeSizeSpan
+import android.text.style.StyleSpan
 import android.util.Log
 import android.util.TypedValue
+import android.view.Gravity
 import android.view.View
 import android.view.WindowInsets
 import android.widget.Button
@@ -20,27 +23,77 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import com.colonysim.core.BuildCategory
+import com.colonysim.core.Building
 import com.colonysim.core.Colony
+import com.colonysim.core.Cost
+import com.colonysim.core.Crop
 import com.colonysim.core.Feature
+import com.colonysim.core.JobType
 import com.colonysim.core.LogKind
 import com.colonysim.core.MapGen
 import com.colonysim.core.Pawn
+import com.colonysim.core.Resource
 import com.colonysim.core.TICKS_PER_DAY
 import com.colonysim.core.Tool
+import com.colonysim.core.describe
 import java.io.File
 import java.util.Locale
 
 class MainActivity : Activity(), ColonyView.Listener {
 
+    /** One button in the options row: either a map tool or a one-off action. */
+    private class Option(
+        val label: String,
+        val detail: String?,
+        val tool: Tool? = null,
+        val cost: Cost = emptyMap(),
+        val action: (() -> Unit)? = null,
+    )
+
+    private class Category(val label: String, val options: () -> List<Option>)
+
     private lateinit var colony: Colony
     private lateinit var colonyView: ColonyView
-    private lateinit var hud: TextView
+    private lateinit var clock: TextView
+    private lateinit var stockText: TextView
     private lateinit var info: TextView
     private lateinit var pauseButton: Button
     private lateinit var speedButton: Button
-    private lateinit var expandButton: Button
-    private val toolButtons = mutableMapOf<Tool, Button>()
+    private lateinit var optionsRow: LinearLayout
+    private val tabButtons = mutableListOf<Button>()
+    private val optionButtons = mutableListOf<Pair<Option, Button>>()
+    private var currentCategory = 0
     private var gameOverShown = false
+
+    private val categories = listOf(
+        Category("Orders") {
+            listOf(
+                Option("Inspect", "tap things", Tool.Inspect),
+                Option("Chop / Mine", "trees, rock, ore", Tool.Harvest),
+                Option("Demolish", "anything", Tool.Demolish),
+                Option("Cancel", "remove orders", Tool.Cancel),
+            )
+        },
+        Category("Farm") {
+            Crop.entries.map { Option(it.label, it.description, Tool.Plant(it)) }
+        },
+        *BuildCategory.entries.map { cat ->
+            Category(cat.label) {
+                Building.entries.filter { it.category == cat }
+                    .map { Option(it.label, it.cost.describe(), Tool.Build(it), it.cost) }
+            }
+        }.toTypedArray(),
+        Category("Colony") {
+            listOf(
+                Option("Expand", colony.expandCost().describe(), cost = colony.expandCost()) { tryExpand() },
+                Option("Colonists", "${colony.pawns.size} living") { showColonists() },
+                Option("Log", "recent events") { showLog() },
+                Option("Help", "how to play") { showHelp() },
+                Option("New colony", "start over") { confirmNewColony() },
+            )
+        },
+    )
 
     private val saveFile: File get() = File(filesDir, "colony.json")
 
@@ -49,7 +102,7 @@ class MainActivity : Activity(), ColonyView.Listener {
         colony = load() ?: MapGen.newColony()
         setContentView(buildLayout())
         colonyView.colony = colony
-        selectTool(Tool.INSPECT)
+        selectCategory(0)
         refresh()
     }
 
@@ -83,6 +136,7 @@ class MainActivity : Activity(), ColonyView.Listener {
         colonyView.colony = colony
         colonyView.paused = false
         save()
+        selectCategory(0)
         refresh()
     }
 
@@ -96,14 +150,44 @@ class MainActivity : Activity(), ColonyView.Listener {
             setBackgroundColor(BG)
         }
 
-        hud = TextView(this).apply {
+        // HUD: clock + time controls, then resources.
+        val hud = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(PANEL)
+            setPadding(dp(10), dp(4), dp(6), dp(6))
+        }
+        val clockRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        clock = TextView(this).apply {
             setTextColor(Color.WHITE)
             textSize = 14f
-            typeface = Typeface.MONOSPACE
-            setPadding(dp(10), dp(6), dp(10), dp(6))
-            setBackgroundColor(PANEL)
+            typeface = Typeface.DEFAULT_BOLD
         }
-        root.addView(hud, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        clockRow.addView(clock, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        pauseButton = pillButton("Pause") {
+            colonyView.paused = !colonyView.paused
+            refresh()
+        }
+        speedButton = pillButton("1x") {
+            colonyView.speed = when (colonyView.speed) {
+                1 -> 2
+                2 -> 4
+                4 -> 8
+                else -> 1
+            }
+            refresh()
+        }
+        clockRow.addView(pauseButton)
+        clockRow.addView(speedButton)
+        hud.addView(clockRow)
+        stockText = TextView(this).apply {
+            setTextColor(0xFFE0E0E0.toInt())
+            textSize = 13.5f
+        }
+        hud.addView(stockText)
+        root.addView(hud, matchWrap())
 
         colonyView = ColonyView(this).also { it.listener = this }
         root.addView(colonyView, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
@@ -113,48 +197,46 @@ class MainActivity : Activity(), ColonyView.Listener {
             textSize = 12.5f
             setPadding(dp(10), dp(6), dp(10), dp(6))
             setBackgroundColor(PANEL)
-            minLines = 6
-            maxLines = 6
+            minLines = 5
+            maxLines = 5
             setOnClickListener { showLog() }
         }
-        root.addView(info, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        root.addView(info, matchWrap())
 
-        val tools = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        for (t in Tool.entries) {
-            val b = smallButton(t.label) { selectTool(t) }
-            toolButtons[t] = b
-            tools.addView(b)
+        optionsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(3), dp(4), dp(3), dp(2))
         }
         root.addView(HorizontalScrollView(this).apply {
             isHorizontalScrollBarEnabled = false
-            addView(tools)
-        })
+            setBackgroundColor(OPTIONS_BG)
+            addView(optionsRow)
+        }, matchWrap())
 
-        val controls = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        pauseButton = smallButton("Pause") {
-            colonyView.paused = !colonyView.paused
-            refresh()
+        val tabs = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setBackgroundColor(PANEL)
+            setPadding(dp(2), dp(2), dp(2), dp(2))
         }
-        speedButton = smallButton("1x") {
-            colonyView.speed = when (colonyView.speed) {
-                1 -> 2
-                2 -> 4
-                4 -> 8
-                else -> 1
+        categories.forEachIndexed { i, cat ->
+            val b = Button(this).apply {
+                text = cat.label
+                isAllCaps = false
+                textSize = 12f
+                setTextColor(Color.WHITE)
+                minWidth = 0
+                minimumWidth = 0
+                minHeight = 0
+                minimumHeight = 0
+                setPadding(dp(2), dp(10), dp(2), dp(10))
+                setOnClickListener { selectCategory(i) }
             }
-            refresh()
+            tabButtons.add(b)
+            tabs.addView(b, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                setMargins(dp(1), 0, dp(1), 0)
+            })
         }
-        expandButton = smallButton("Expand") { tryExpand() }
-        controls.addView(pauseButton)
-        controls.addView(speedButton)
-        controls.addView(expandButton)
-        controls.addView(smallButton("Log") { showLog() })
-        controls.addView(smallButton("Help") { showHelp() })
-        controls.addView(smallButton("New") { confirmNewColony() })
-        root.addView(HorizontalScrollView(this).apply {
-            isHorizontalScrollBarEnabled = false
-            addView(controls)
-        })
+        root.addView(tabs, matchWrap())
 
         // Android 15 draws apps edge-to-edge; keep our UI clear of the system bars.
         root.setOnApplyWindowInsetsListener { v, insets ->
@@ -170,7 +252,12 @@ class MainActivity : Activity(), ColonyView.Listener {
         return root
     }
 
-    private fun smallButton(label: String, onClick: () -> Unit) = Button(this).apply {
+    private fun matchWrap() = LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT,
+        LinearLayout.LayoutParams.WRAP_CONTENT,
+    )
+
+    private fun pillButton(label: String, onClick: () -> Unit) = Button(this).apply {
         text = label
         isAllCaps = false
         textSize = 13f
@@ -179,37 +266,90 @@ class MainActivity : Activity(), ColonyView.Listener {
         minimumWidth = 0
         minHeight = 0
         minimumHeight = 0
-        setPadding(dp(12), dp(8), dp(12), dp(8))
-        background = buttonBackground(false)
+        setPadding(dp(12), dp(6), dp(12), dp(6))
+        background = rounded(BUTTON)
         layoutParams = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT,
             LinearLayout.LayoutParams.WRAP_CONTENT,
-        ).apply { setMargins(dp(3), dp(3), dp(3), dp(3)) }
+        ).apply { setMargins(dp(3), dp(2), dp(3), dp(2)) }
         setOnClickListener { onClick() }
     }
 
-    private fun buttonBackground(active: Boolean) = GradientDrawable().apply {
+    private fun rounded(color: Int) = GradientDrawable().apply {
         cornerRadius = dp(8).toFloat()
-        setColor(if (active) 0xFF3D6E9E.toInt() else 0xFF333A44.toInt())
+        setColor(color)
     }
 
-    private fun selectTool(t: Tool) {
-        colonyView.tool = t
-        if (t != Tool.INSPECT) colonyView.clearSelection()
-        toolButtons.forEach { (tool, b) -> b.background = buttonBackground(tool == t) }
-        if (t != Tool.INSPECT) {
-            Toast.makeText(this, "${t.label}: drag to paint, two fingers to pan", Toast.LENGTH_SHORT).show()
+    // ------------------------------------------------------------ menus
+
+    private fun selectCategory(i: Int) {
+        currentCategory = i
+        tabButtons.forEachIndexed { j, b -> b.background = rounded(if (i == j) ACTIVE else BUTTON) }
+        rebuildOptions()
+        refresh()
+    }
+
+    private fun rebuildOptions() {
+        optionsRow.removeAllViews()
+        optionButtons.clear()
+        for (opt in categories[currentCategory].options()) {
+            val b = Button(this).apply {
+                isAllCaps = false
+                textSize = 13f
+                setTextColor(Color.WHITE)
+                minWidth = 0
+                minimumWidth = 0
+                minHeight = 0
+                minimumHeight = 0
+                setPadding(dp(12), dp(6), dp(12), dp(6))
+                setOnClickListener { onOption(opt) }
+            }
+            optionButtons.add(opt to b)
+            optionsRow.addView(b, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { setMargins(dp(3), 0, dp(3), dp(2)) })
         }
+        updateOptionButtons()
+    }
+
+    private fun updateOptionButtons() {
+        for ((opt, b) in optionButtons) {
+            val affordable = colony.canAfford(opt.cost)
+            val sb = SpannableStringBuilder(opt.label)
+            sb.setSpan(StyleSpan(Typeface.BOLD), 0, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            opt.detail?.let {
+                val start = sb.length
+                sb.append('\n').append(it)
+                sb.setSpan(RelativeSizeSpan(0.78f), start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                sb.setSpan(
+                    ForegroundColorSpan(if (affordable) 0xFFB0BEC5.toInt() else BAD),
+                    start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+                )
+            }
+            b.text = sb
+            val selected = opt.tool != null && opt.tool == colonyView.tool
+            b.background = rounded(if (selected) ACTIVE else BUTTON)
+            b.alpha = if (affordable) 1f else 0.7f
+        }
+    }
+
+    private fun onOption(opt: Option) {
+        opt.action?.invoke()
+        val tool = opt.tool ?: return
+        colonyView.tool = tool
+        if (tool != Tool.Inspect) colonyView.clearSelection()
         refresh()
     }
 
     // ------------------------------------------------------------ actions
 
     private fun tryExpand() {
-        val (w, s) = colony.expandCost()
+        val cost = colony.expandCost()
         if (!colony.expand()) {
-            Toast.makeText(this, "Expanding needs $w wood and $s stone", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Expanding needs ${cost.describe()}", Toast.LENGTH_SHORT).show()
         }
+        rebuildOptions()
         refresh()
     }
 
@@ -219,6 +359,24 @@ class MainActivity : Activity(), ColonyView.Listener {
             .setMessage("Your current colony will be lost.")
             .setPositiveButton("New colony") { _, _ -> newColony() }
             .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun showColonists() {
+        val pawns = colony.pawns.toList()
+        if (pawns.isEmpty()) return
+        val items = pawns.map { p ->
+            "${p.name} — ${p.status()}\n" +
+                "Food ${p.hunger.toInt()} · Rest ${p.rest.toInt()} · Mood ${p.mood.toInt()} · Health ${p.health.toInt()}"
+        }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("Colonists")
+            .setItems(items) { _, which ->
+                colonyView.tool = Tool.Inspect
+                selectCategory(0)
+                colonyView.selectPawn(pawns[which].id)
+            }
+            .setNegativeButton("Close", null)
             .show()
     }
 
@@ -242,18 +400,19 @@ class MainActivity : Activity(), ColonyView.Listener {
             .setTitle("How to play")
             .setMessage(
                 """
-                Your colonists look after themselves: they eat, sleep and work on whatever you order.
+                Colonists look after themselves: they eat, sleep, cook, take medicine and work on whatever you order. Pick a tab at the bottom, then an option, then drag on the map. Two fingers pan and zoom.
 
-                • Chop/Mine — mark trees and rocks for wood and stone.
-                • Farm — plant fields. Colonists harvest ripe crops automatically. Nothing grows in winter, and stored food slowly spoils.
-                • Bed — costs ${Colony.BED_WOOD} wood. Sleeping on the ground makes colonists unhappy.
-                • Wall — costs ${Colony.WALL_STONE} stone.
-                • Demolish / Cancel — remove buildings or orders.
-                • Expand — claim more land.
+                Orders — Chop/Mine trees, rock and metal ore. Demolish removes anything (half the materials come back) and instantly scraps unbuilt blueprints.
 
-                Spare beds and a happy colony attract wanderers. Unhappy colonists can have mental breaks; starving ones die.
+                Farm — Potatoes grow fast, corn slowly but in bulk, healroot gives herbs. Nothing grows in winter and raw food spoils, so stock up.
 
-                Tap a colonist to see their needs. Bars: orange = food, blue = rest, green = mood. Drag to pan, pinch to zoom. Tap the info panel for the full log.
+                Build — Walls plus doors make an enclosed room. Sleeping in a room beats sleeping outside, and wolves and boars can't reach colonists indoors. Floors and statues make rooms impressive. Tap a tile to see its room.
+
+                Kitchen — A campfire or stove turns 3 raw food into 2 meals, which are more filling and taste better. Tables make mealtimes nicer.
+
+                Colony — Expand the map, check on colonists, read the log.
+
+                Spare beds and a happy colony attract wanderers. Unhappy colonists have mental breaks; starving ones die. Herbs cure illness and heal wounds.
                 """.trimIndent()
             )
             .setPositiveButton("Got it", null)
@@ -285,17 +444,15 @@ class MainActivity : Activity(), ColonyView.Listener {
     private fun refresh() {
         val c = colony
         val minute = ((c.tick % TICKS_PER_DAY) * 24 * 60 / TICKS_PER_DAY) % 60
-        hud.text = String.format(
-            Locale.US,
-            "Day %d  %02d:%02d  %s Y%d\nFood %d  Wood %d  Stone %d  Pop %d  Beds %d",
-            c.day, c.hour, minute, c.season.label, c.year,
-            c.food, c.wood, c.stone, c.pawns.size, c.count(Feature.BED),
+        clock.text = String.format(
+            Locale.US, "Day %d  %02d:%02d  %s, year %d  ·  %d colonists",
+            c.day, c.hour, minute, c.season.label, c.year, c.pawns.size,
         )
-        pauseButton.text = if (colonyView.paused) "Play" else "Pause"
-        pauseButton.background = buttonBackground(colonyView.paused)
+        stockText.text = Resource.entries.joinToString("   ") { "${it.icon} ${c[it]}" }
+        pauseButton.text = if (colonyView.paused) "▶ Play" else "❚❚ Pause"
+        pauseButton.background = rounded(if (colonyView.paused) ACTIVE else BUTTON)
         speedButton.text = "${colonyView.speed}x"
-        val (w, s) = c.expandCost()
-        expandButton.text = "Expand (${w}w ${s}s)"
+        updateOptionButtons()
         info.text = infoText()
     }
 
@@ -303,29 +460,63 @@ class MainActivity : Activity(), ColonyView.Listener {
         val c = colony
         val pawn = c.pawns.firstOrNull { it.id == colonyView.selectedPawnId }
         if (pawn != null) return pawnInfo(pawn)
+        val tool = colonyView.tool
+        if (tool != Tool.Inspect) return toolInfo(tool)
         val pos = colonyView.selectedTile
         if (pos != null) {
             val t = c.tile(pos.x, pos.y)
             val sb = StringBuilder()
-            sb.append("Tile ${pos.x},${pos.y}: ${t.terrain.name.lowercase()}")
-            if (t.feature != Feature.NONE) sb.append(", ${t.feature.name.lowercase().replace('_', ' ')}")
-            if (t.feature == Feature.FIELD || t.feature == Feature.BERRY_BUSH) sb.append(" (${t.growth.toInt()}% grown)")
-            t.designation?.let { sb.append("\nOrder: ${it.label}") }
+            sb.append(t.terrain.name.lowercase().replace('_', ' ').replaceFirstChar { it.uppercase() })
+            if (t.feature != Feature.NONE) sb.append(" · ${t.feature.label}")
+            if (t.feature == Feature.FIELD) sb.append(" (${t.crop?.label ?: "Potatoes"})")
+            if (t.feature == Feature.FIELD || t.feature == Feature.BERRY_BUSH) sb.append(", ${t.growth.toInt()}% grown")
+            sb.append("\n").append(c.roomAt(pos.x, pos.y)?.description ?: "Part of a wall")
+            t.designation?.let { d ->
+                sb.append("\nOrder: ${d.label}")
+                t.blueprint?.let { b ->
+                    sb.append(" ${b.label.lowercase()} (${b.cost.describe()})")
+                    if (!c.canAfford(b.cost)) sb.append(" — waiting for materials")
+                }
+                if (d == JobType.PLANT_FIELD) t.crop?.let { sb.append(" ${it.label.lowercase()}") }
+            }
             c.pawnAt(pos.x, pos.y)?.let { sb.append("\n${it.name} is here") }
             return sb
         }
         val sb = SpannableStringBuilder()
-        if (colonyView.tool != Tool.INSPECT) {
-            sb.append("Tool: ${colonyView.tool.label} — drag on the map to paint orders.\n")
-        }
         for (e in c.log.takeLast(5).asReversed()) appendLogLine(sb, e.text, e.kind)
+        return sb
+    }
+
+    private fun toolInfo(tool: Tool): CharSequence {
+        val sb = SpannableStringBuilder()
+        val start = sb.length
+        sb.append(tool.label)
+        sb.setSpan(StyleSpan(Typeface.BOLD), start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        when (tool) {
+            is Tool.Build -> {
+                val b = tool.building
+                sb.append(" — ${b.description}\nCost: ${b.cost.describe()}")
+                if (!colony.canAfford(b.cost)) {
+                    val s = sb.length
+                    sb.append("  (not enough yet — blueprints wait for materials)")
+                    sb.setSpan(ForegroundColorSpan(BAD), s, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                }
+            }
+            is Tool.Plant -> sb.append(" — ${tool.crop.description}. Plant on grass or dirt, or on an existing field to switch crops.")
+            Tool.Harvest -> sb.append(" — trees give wood, rock gives stone, ore gives metal.")
+            Tool.Demolish -> sb.append(" — tears down buildings, floors and fields for half their materials. Scraps unbuilt blueprints instantly.")
+            Tool.Cancel -> sb.append(" — removes pending orders.")
+            Tool.Inspect -> {}
+        }
+        sb.append("\nDrag on the map to apply. Two fingers to pan. Pick Inspect to stop.")
         return sb
     }
 
     private fun pawnInfo(p: Pawn): CharSequence {
         val sb = SpannableStringBuilder()
         sb.append("${p.name}, ${p.age} — ${p.trait.label} (${p.trait.description})\n")
-        sb.append("${p.status()}\n")
+        val where = if (colony.isIndoors(p.x, p.y)) "indoors" else "outdoors"
+        sb.append("${p.status()} · $where\n")
         sb.append("Food ${p.hunger.toInt()}  Rest ${p.rest.toInt()}  Mood ${p.mood.toInt()}  Health ${p.health.toInt()}\n")
         val mods = p.moodModifiers()
         if (mods.isEmpty()) {
@@ -356,6 +547,9 @@ class MainActivity : Activity(), ColonyView.Listener {
         private const val TAG = "ColonySim"
         private const val BG = 0xFF1B1F24.toInt()
         private const val PANEL = 0xFF242A31.toInt()
+        private const val OPTIONS_BG = 0xFF1F2429.toInt()
+        private const val BUTTON = 0xFF333A44.toInt()
+        private const val ACTIVE = 0xFF3D6E9E.toInt()
         private const val GOOD = 0xFF81C784.toInt()
         private const val BAD = 0xFFE57373.toInt()
     }

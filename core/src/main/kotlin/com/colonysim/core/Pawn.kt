@@ -3,21 +3,23 @@ package com.colonysim.core
 import kotlinx.serialization.Serializable
 
 @Serializable
-enum class JobType(val label: String, val work: Float) {
-    CHOP("Chopping", 30f),
-    MINE("Mining", 50f),
-    PLANT_FIELD("Planting", 15f),
-    BUILD_BED("Building bed", 40f),
-    BUILD_WALL("Building wall", 25f),
-    DEMOLISH("Demolishing", 20f),
-    HARVEST_FIELD("Harvesting", 12f),
-    FORAGE("Foraging", 8f),
-    EAT("Eating", 6f),
-    SLEEP("Sleeping", 0f),
-    WANDER("Wandering", 0f);
+enum class JobType(val label: String, val isWork: Boolean) {
+    CHOP("Chopping", true),
+    MINE("Mining", true),
+    PLANT_FIELD("Planting", true),
+    BUILD("Building", true),
+    DEMOLISH("Demolishing", true),
+    HARVEST_FIELD("Harvesting", true),
+    FORAGE("Foraging", true),
+    COOK("Cooking", true),
+    EAT("Eating", false),
+    MEDICINE("Taking medicine", false),
+    SLEEP("Sleeping", false),
+    WANDER("Wandering", false),
 
-    /** Jobs that happen at a target tile and are skipped if someone else already claimed it. */
-    val isWork: Boolean get() = work > 0f && this != EAT
+    // Only present in saves from before generic construction; migrated on load.
+    BUILD_BED("Building", true),
+    BUILD_WALL("Building", true),
 }
 
 @Serializable
@@ -43,6 +45,8 @@ data class Job(
     var progress: Float = 0f,
     /** For SLEEP: whether the target is a bed. */
     val inBed: Boolean = false,
+    /** For EAT: whether the pawn walked to a table. */
+    val atTable: Boolean = false,
 )
 
 @Serializable
@@ -60,6 +64,7 @@ class Pawn(
     var health: Float = 100f,
     var sickTicks: Int = 0,
     var breakTicks: Int = 0,
+    var medicineCooldown: Int = 0,
     var job: Job? = null,
     val path: MutableList<Pos> = mutableListOf(),
     val thoughts: MutableList<Thought> = mutableListOf(),
@@ -87,6 +92,12 @@ class Pawn(
         // Refresh an existing thought rather than stacking duplicates.
         thoughts.removeAll { it.label == label }
         thoughts.add(Thought(label, value, ticks))
+    }
+
+    /** Adds a thought, replacing any others from the same mutually exclusive group. */
+    fun addThought(group: Collection<String>, label: String, value: Int, ticks: Int) {
+        thoughts.removeAll { it.label in group }
+        addThought(label, value, ticks)
     }
 
     fun status(): String = when {

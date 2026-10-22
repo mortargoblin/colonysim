@@ -1,14 +1,30 @@
 package com.colonysim.core
 
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.Transient
 import kotlinx.serialization.json.Json
 import kotlin.math.abs
+import kotlin.math.max
 import kotlin.random.Random
 
 const val TICKS_PER_DAY = 240
 const val DAYS_PER_SEASON = 8
 private const val MAX_LOG = 60
+
+private val SLEEP_THOUGHTS = setOf(
+    "Slept in a nice bedroom", "Slept in a bedroom", "Slept outside", "Slept on the ground",
+)
+private val MEAL_THOUGHTS = setOf("Ate raw food", "Ate a cooked meal")
+
+fun startingStock(): MutableMap<Resource, Int> = mutableMapOf(
+    Resource.FOOD to 24,
+    Resource.MEAL to 0,
+    Resource.WOOD to 20,
+    Resource.STONE to 0,
+    Resource.METAL to 0,
+    Resource.HERBS to 3,
+)
 
 @Serializable
 class Colony(
@@ -17,18 +33,23 @@ class Colony(
     var tiles: MutableList<Tile>,
     val seed: Long,
     val pawns: MutableList<Pawn> = mutableListOf(),
-    var food: Int = 24,
-    var wood: Int = 12,
-    var stone: Int = 0,
+    val stock: MutableMap<Resource, Int> = startingStock(),
     var tick: Long = 0,
     var nextPawnId: Int = 1,
     var nextEventTick: Long = TICKS_PER_DAY.toLong(),
     var coldSnapTicks: Int = 0,
     val log: MutableList<LogEntry> = mutableListOf(),
     val stats: Stats = Stats(),
+    // Resource counts from saves made before [stock] existed.
+    @SerialName("food") private var legacyFood: Int? = null,
+    @SerialName("wood") private var legacyWood: Int? = null,
+    @SerialName("stone") private var legacyStone: Int? = null,
 ) {
     @Transient
     var rng: Random = Random(seed)
+
+    @Transient
+    private var roomMap: RoomMap? = null
 
     // ---------------------------------------------------------------- time
 
@@ -38,6 +59,7 @@ class Colony(
     val season: Season get() = Season.entries[((day - 1) / DAYS_PER_SEASON) % 4]
     val year: Int get() = (day - 1) / (DAYS_PER_SEASON * 4) + 1
     val isGameOver: Boolean get() = pawns.isEmpty()
+    val isCold: Boolean get() = season == Season.WINTER || coldSnapTicks > 0
 
     /** 0 = full daylight, 1 = darkest night. */
     val darkness: Float
@@ -52,6 +74,20 @@ class Colony(
             }
         }
 
+    // ---------------------------------------------------------------- resources
+
+    operator fun get(r: Resource): Int = stock[r] ?: 0
+
+    fun add(r: Resource, n: Int) {
+        stock[r] = max(0, this[r] + n)
+    }
+
+    fun canAfford(cost: Cost) = cost.all { (r, n) -> this[r] >= n }
+
+    private fun spend(cost: Cost) = cost.forEach { (r, n) -> add(r, -n) }
+
+    val edibleFood: Int get() = this[Resource.FOOD] + this[Resource.MEAL]
+
     // ---------------------------------------------------------------- grid
 
     fun inBounds(x: Int, y: Int) = x in 0 until width && y in 0 until height
@@ -61,6 +97,26 @@ class Colony(
     fun count(feature: Feature) = tiles.count { it.feature == feature }
 
     fun pawnAt(x: Int, y: Int): Pawn? = pawns.firstOrNull { it.x == x && it.y == y }
+
+    fun neighbors(x: Int, y: Int): List<Pos> = buildList {
+        if (x > 0) add(Pos(x - 1, y))
+        if (x < width - 1) add(Pos(x + 1, y))
+        if (y > 0) add(Pos(x, y - 1))
+        if (y < height - 1) add(Pos(x, y + 1))
+    }
+
+    /** The room containing a tile (null for walls and doors). Recomputed lazily after construction. */
+    fun roomAt(x: Int, y: Int): Room? {
+        val map = roomMap ?: RoomMap(this).also { roomMap = it }
+        return map.at(x, y)
+    }
+
+    fun isIndoors(x: Int, y: Int) = roomAt(x, y)?.indoors == true
+
+    /** Call after anything changes walls, doors, floors or furniture. */
+    fun markRoomsDirty() {
+        roomMap = null
+    }
 
     // ---------------------------------------------------------------- log
 
@@ -120,39 +176,86 @@ class Colony(
     fun applyTool(tool: Tool, x: Int, y: Int): Boolean {
         if (!inBounds(x, y)) return false
         val t = tile(x, y)
-        val order: JobType? = when (tool) {
-            Tool.INSPECT -> return false
-            Tool.CANCEL -> {
+        when (tool) {
+            Tool.Inspect -> return false
+            Tool.Cancel -> {
                 val had = t.designation != null
-                t.designation = null
+                clearOrder(t)
                 return had
             }
-            Tool.HARVEST -> when (t.feature) {
-                Feature.TREE, Feature.BERRY_BUSH -> JobType.CHOP
-                Feature.ROCK -> JobType.MINE
-                else -> null
+            Tool.Demolish -> {
+                // Unbuilt blueprints and unplanted fields are simply removed.
+                if (t.designation == JobType.BUILD || t.designation == JobType.PLANT_FIELD) {
+                    clearOrder(t)
+                    return true
+                }
+                val order = when {
+                    t.hasStructure -> JobType.DEMOLISH
+                    t.feature == Feature.TREE || t.feature == Feature.BERRY_BUSH -> JobType.CHOP
+                    t.feature == Feature.ROCK || t.feature == Feature.ORE -> JobType.MINE
+                    else -> return false
+                }
+                return setOrder(t, order)
             }
-            Tool.FIELD -> if (t.buildable && t.terrain != Terrain.SAND) JobType.PLANT_FIELD else null
-            Tool.BED -> if (t.buildable) JobType.BUILD_BED else null
-            Tool.WALL -> if (t.buildable) JobType.BUILD_WALL else null
-            Tool.DEMOLISH -> when (t.feature) {
-                Feature.BED, Feature.WALL, Feature.FIELD -> JobType.DEMOLISH
-                else -> null
+            Tool.Harvest -> {
+                val order = when (t.feature) {
+                    Feature.TREE, Feature.BERRY_BUSH -> JobType.CHOP
+                    Feature.ROCK, Feature.ORE -> JobType.MINE
+                    else -> return false
+                }
+                return setOrder(t, order)
+            }
+            is Tool.Plant -> {
+                if (t.terrain == Terrain.SAND || t.terrain.isFloor) return false
+                if (t.feature == Feature.FIELD) {
+                    // Switching an existing field's crop replants it from scratch.
+                    if (t.crop == tool.crop) return false
+                    t.crop = tool.crop
+                    t.growth = 0f
+                    return true
+                }
+                if (t.terrain == Terrain.WATER || t.feature != Feature.NONE) return false
+                if (t.designation == JobType.PLANT_FIELD && t.crop == tool.crop) return false
+                clearOrder(t)
+                t.designation = JobType.PLANT_FIELD
+                t.crop = tool.crop
+                return true
+            }
+            is Tool.Build -> {
+                val b = tool.building
+                if (!t.canBuild(b)) return false
+                if (t.designation == JobType.BUILD && t.blueprint == b) return false
+                clearOrder(t)
+                t.designation = JobType.BUILD
+                t.blueprint = b
+                return true
             }
         }
-        if (order == null || t.designation == order) return false
+    }
+
+    private fun setOrder(t: Tile, order: JobType): Boolean {
+        if (t.designation == order) return false
+        clearOrder(t)
         t.designation = order
         return true
     }
 
-    fun expandCost(): Pair<Int, Int> = (20 + stats.expansions * 15) to (10 + stats.expansions * 10)
+    private fun clearOrder(t: Tile) {
+        if (t.designation == JobType.PLANT_FIELD && t.feature != Feature.FIELD) t.crop = null
+        t.designation = null
+        t.blueprint = null
+    }
+
+    fun expandCost(): Cost = mapOf(
+        Resource.WOOD to 20 + stats.expansions * 15,
+        Resource.STONE to 10 + stats.expansions * 10,
+    )
 
     /** Grows the map by 8 tiles to the right and bottom. Returns false if unaffordable. */
     fun expand(): Boolean {
-        val (w, s) = expandCost()
-        if (wood < w || stone < s) return false
-        wood -= w
-        stone -= s
+        val cost = expandCost()
+        if (!canAfford(cost)) return false
+        spend(cost)
         val nw = width + 8
         val nh = height + 8
         val newTiles = MutableList(nw * nh) { i ->
@@ -164,6 +267,7 @@ class Colony(
         height = nh
         tiles = newTiles
         stats.expansions++
+        markRoomsDirty()
         log("The colony claimed new land. The map is now ${width}x$height.", LogKind.GOOD)
         return true
     }
@@ -181,10 +285,11 @@ class Colony(
             nextEventTick = tick + rng.nextInt(TICKS_PER_DAY * 2 / 3, TICKS_PER_DAY * 2)
         }
         if (tick % TICKS_PER_DAY == 0L) {
-            // A little food spoils every day, so hoarding has limits and winter bites.
-            food -= food * 3 / 100
-            val d = day
-            if ((d - 1) % DAYS_PER_SEASON == 0) log("${season.label} of year $year has begun.", LogKind.INFO)
+            // Food spoils a little every day (cooked meals keep better), so hoarding
+            // has limits and winter bites.
+            add(Resource.FOOD, -this[Resource.FOOD] * 3 / 100)
+            add(Resource.MEAL, -this[Resource.MEAL] / 100)
+            if ((day - 1) % DAYS_PER_SEASON == 0) log("${season.label} of year $year has begun.", LogKind.INFO)
         }
     }
 
@@ -193,7 +298,10 @@ class Colony(
         if (coldSnapTicks > 0) coldSnapTicks--
         for (t in tiles) {
             when (t.feature) {
-                Feature.FIELD -> t.growth = (t.growth + 0.2f * factor).coerceAtMost(100f)
+                Feature.FIELD -> {
+                    val rate = (t.crop ?: Crop.POTATO).growRate
+                    t.growth = (t.growth + rate * factor).coerceAtMost(100f)
+                }
                 Feature.BERRY_BUSH -> t.growth = (t.growth + 0.15f * factor).coerceAtMost(100f)
                 else -> {}
             }
@@ -204,7 +312,7 @@ class Colony(
             val y = rng.nextInt(height)
             val t = tile(x, y)
             if (t.terrain == Terrain.GRASS && t.feature == Feature.NONE && t.designation == null &&
-                pawnAt(x, y) == null
+                pawnAt(x, y) == null && !isIndoors(x, y)
             ) {
                 val nearTree = neighbors(x, y).any { tile(it.x, it.y).feature == Feature.TREE }
                 when {
@@ -226,6 +334,7 @@ class Colony(
             val restRate = if (p.trait == Trait.NIGHT_OWL) 0.22f else 0.3f
             p.rest = (p.rest - restRate).coerceAtLeast(0f)
         }
+        if (p.medicineCooldown > 0) p.medicineCooldown--
 
         // Health.
         if (p.hunger <= 0f) p.health -= 0.15f
@@ -244,6 +353,7 @@ class Colony(
         // Mood.
         p.thoughts.forEach { it.ticksLeft-- }
         p.thoughts.removeAll { it.ticksLeft <= 0 }
+        if ((tick + p.id) % 30 == 0L && statueNear(p.x, p.y)) p.addThought("Admired a statue", 5, 60)
         val target = p.targetMood()
         p.mood += (target - p.mood).coerceIn(-0.4f, 0.4f)
 
@@ -279,13 +389,25 @@ class Colony(
         perform(p, job)
     }
 
+    private fun statueNear(x: Int, y: Int): Boolean {
+        for (dy in -4..4) for (dx in -4..4) {
+            val nx = x + dx
+            val ny = y + dy
+            if (inBounds(nx, ny) && tile(nx, ny).feature == Feature.STATUE) return true
+        }
+        return false
+    }
+
     private fun startMentalBreak(p: Pawn) {
         p.breakTicks = rng.nextInt(80, 180)
         p.job = null
         p.path.clear()
-        if (food >= 3 && rng.nextBoolean()) {
-            val eaten = minOf(food, rng.nextInt(3, 7))
-            food -= eaten
+        if (edibleFood >= 3 && rng.nextBoolean()) {
+            var eaten = 0
+            repeat(rng.nextInt(3, 7)) {
+                val r = if (this[Resource.MEAL] > 0) Resource.MEAL else Resource.FOOD
+                if (this[r] > 0) { add(r, -1); eaten++ }
+            }
             p.hunger = 100f
             log("${p.name} snapped and went on a food binge, eating $eaten meals.", LogKind.BAD)
         } else {
@@ -310,9 +432,13 @@ class Colony(
             wander(p, 6)
             return
         }
+        if ((p.sickTicks > 0 || p.health < 60f) && this[Resource.HERBS] > 0 && p.medicineCooldown == 0) {
+            p.job = Job(JobType.MEDICINE, p.x, p.y)
+            return
+        }
         if (p.hunger < 30f) {
-            if (food > 0) {
-                p.job = Job(JobType.EAT, p.x, p.y)
+            if (edibleFood > 0) {
+                goEat(p)
                 return
             }
             if (findWork(p, foodOnly = true)) return
@@ -342,17 +468,35 @@ class Colony(
         }
     }
 
+    /** Eat at a nearby table if there is one, otherwise on the spot. */
+    private fun goEat(p: Pawn) {
+        p.path.clear()
+        val path = Pathfinder.find(this, p.x, p.y, maxNodes = 900) { x, y ->
+            neighbors(x, y).any { tile(it.x, it.y).feature == Feature.TABLE }
+        }
+        if (path != null) {
+            val dest = path.lastOrNull() ?: Pos(p.x, p.y)
+            p.job = Job(JobType.EAT, dest.x, dest.y, atTable = true)
+            p.path.addAll(path)
+        } else {
+            p.job = Job(JobType.EAT, p.x, p.y)
+        }
+    }
+
     private fun goToSleep(p: Pawn) {
         val taken = pawns.filter { it !== p && it.job?.type == JobType.SLEEP }
             .map { Pos(it.job!!.x, it.job!!.y) }.toSet()
-        val path = Pathfinder.find(this, p.x, p.y) { x, y ->
+        // Prefer a bed indoors: search for one first, then any bed.
+        val bedPath = Pathfinder.find(this, p.x, p.y) { x, y ->
+            tile(x, y).feature == Feature.BED && Pos(x, y) !in taken && isIndoors(x, y)
+        } ?: Pathfinder.find(this, p.x, p.y) { x, y ->
             tile(x, y).feature == Feature.BED && Pos(x, y) !in taken
         }
         p.path.clear()
-        if (path != null) {
-            val dest = path.lastOrNull() ?: Pos(p.x, p.y)
+        if (bedPath != null) {
+            val dest = bedPath.lastOrNull() ?: Pos(p.x, p.y)
             p.job = Job(JobType.SLEEP, dest.x, dest.y, inBed = true)
-            p.path.addAll(path)
+            p.path.addAll(bedPath)
         } else {
             p.job = Job(JobType.SLEEP, p.x, p.y, inBed = false)
         }
@@ -360,20 +504,44 @@ class Colony(
 
     /** What job (if any) is currently available at a tile. */
     private fun availableJob(t: Tile, foodOnly: Boolean, foodLow: Boolean): JobType? {
-        if (t.feature == Feature.FIELD && t.growth >= 100f) return JobType.HARVEST_FIELD
+        // Player orders to tear something down take precedence over harvesting it.
+        if (t.designation == JobType.DEMOLISH && !foodOnly) return if (t.hasStructure) JobType.DEMOLISH else null
+        if (t.feature == Feature.FIELD && t.growth >= 100f) {
+            val crop = t.crop ?: Crop.POTATO
+            if (!foodOnly || crop.yields == Resource.FOOD) return JobType.HARVEST_FIELD
+        }
         if (t.feature == Feature.BERRY_BUSH && t.growth >= 100f && (foodOnly || foodLow)) return JobType.FORAGE
         if (foodOnly) return null
+        if ((t.feature == Feature.CAMPFIRE || t.feature == Feature.STOVE) &&
+            this[Resource.FOOD] >= 3 && this[Resource.MEAL] < pawns.size * 4
+        ) return JobType.COOK
         return when (val d = t.designation) {
             null -> null
-            JobType.BUILD_BED -> if (wood >= BED_WOOD && t.buildable) d else null
-            JobType.BUILD_WALL -> if (stone >= WALL_STONE && t.buildable) d else null
-            JobType.PLANT_FIELD -> if (t.buildable) d else null
-            else -> d
+            JobType.BUILD -> {
+                val b = t.blueprint ?: return null
+                if (canAfford(b.cost) && t.canBuild(b)) d else null
+            }
+            JobType.PLANT_FIELD -> if (t.feature == Feature.NONE) d else null
+            JobType.CHOP -> if (t.feature == Feature.TREE || t.feature == Feature.BERRY_BUSH) d else null
+            JobType.MINE -> if (t.feature == Feature.ROCK || t.feature == Feature.ORE) d else null
+            else -> null
         }
     }
 
+    private fun workRequired(type: JobType, t: Tile): Float = when (type) {
+        JobType.CHOP -> if (t.feature == Feature.TREE) 30f else 8f
+        JobType.MINE -> if (t.feature == Feature.ORE) 70f else 50f
+        JobType.PLANT_FIELD -> 15f
+        JobType.BUILD -> t.blueprint?.work ?: 20f
+        JobType.DEMOLISH -> if (t.feature == Feature.NONE) 8f else 20f
+        JobType.HARVEST_FIELD -> 12f
+        JobType.FORAGE -> 8f
+        JobType.COOK -> if (t.feature == Feature.STOVE) 10f else 20f
+        else -> 6f
+    }
+
     private fun findWork(p: Pawn, foodOnly: Boolean): Boolean {
-        val foodLow = food < pawns.size * 5
+        val foodLow = edibleFood < pawns.size * 5
         val claimed = HashSet<Int>()
         for (o in pawns) {
             val j = o.job ?: continue
@@ -399,10 +567,15 @@ class Colony(
         return true
     }
 
-    /** A job tile workable while standing at (x, y): the tile itself or one of its 4 neighbours. */
+    /**
+     * A job tile workable while standing at (x, y): one of its 4 neighbours, or the
+     * tile itself unless the job would put something solid where the pawn stands.
+     */
     private fun workTargetFrom(x: Int, y: Int, jobs: Map<Int, JobType>): Int {
         val here = y * width + x
-        if (here in jobs) return here
+        if (here in jobs && !(jobs[here] == JobType.BUILD && tiles[here].blueprint?.blocksMovement == true)) {
+            return here
+        }
         for (n in neighbors(x, y)) {
             val i = n.y * width + n.x
             if (i in jobs) return i
@@ -410,22 +583,24 @@ class Colony(
         return -1
     }
 
-    fun neighbors(x: Int, y: Int): List<Pos> = buildList {
-        if (x > 0) add(Pos(x - 1, y))
-        if (x < width - 1) add(Pos(x + 1, y))
-        if (y > 0) add(Pos(x, y - 1))
-        if (y < height - 1) add(Pos(x, y + 1))
-    }
-
     private fun perform(p: Pawn, job: Job) {
         when (job.type) {
             JobType.WANDER -> p.job = null
             JobType.EAT -> {
                 job.progress += 1f
-                if (job.progress >= job.type.work) {
-                    if (food > 0) {
-                        food--
-                        p.hunger = (p.hunger + 55f).coerceAtMost(100f)
+                if (job.progress >= 6f) {
+                    eat(p, job.atTable)
+                    p.job = null
+                }
+            }
+            JobType.MEDICINE -> {
+                job.progress += 1f
+                if (job.progress >= 5f) {
+                    if (this[Resource.HERBS] > 0) {
+                        add(Resource.HERBS, -1)
+                        p.health = (p.health + 30f).coerceAtMost(100f)
+                        p.sickTicks /= 4
+                        p.medicineCooldown = TICKS_PER_DAY / 2
                     }
                     p.job = null
                 }
@@ -438,13 +613,40 @@ class Colony(
                 p.rest = (p.rest + if (job.inBed) 1.1f else 0.7f).coerceAtMost(100f)
                 val rested = p.rest >= 100f || (!isNight && p.rest >= 80f)
                 if (rested || p.hunger < 8f) {
-                    if (job.inBed) p.addThought("Slept in a bed", 4, TICKS_PER_DAY)
-                    else p.addThought("Slept on the ground", -8, TICKS_PER_DAY)
+                    wakeUp(p, job)
                     p.job = null
                 }
             }
             else -> doWork(p, job)
         }
+    }
+
+    private fun eat(p: Pawn, atTable: Boolean) {
+        if (this[Resource.MEAL] > 0) {
+            add(Resource.MEAL, -1)
+            p.hunger = (p.hunger + 90f).coerceAtMost(100f)
+            p.addThought(MEAL_THOUGHTS, "Ate a cooked meal", 3, TICKS_PER_DAY / 2)
+        } else if (this[Resource.FOOD] > 0) {
+            add(Resource.FOOD, -1)
+            p.hunger = (p.hunger + 50f).coerceAtMost(100f)
+            p.addThought(MEAL_THOUGHTS, "Ate raw food", -4, TICKS_PER_DAY / 2)
+        } else {
+            return
+        }
+        if (atTable) p.addThought("Ate at a table", 4, TICKS_PER_DAY / 2)
+    }
+
+    private fun wakeUp(p: Pawn, job: Job) {
+        val room = roomAt(job.x, job.y)
+        val indoors = room?.indoors == true
+        when {
+            job.inBed && indoors && room!!.impressiveness >= Room.NICE_ROOM ->
+                p.addThought(SLEEP_THOUGHTS, "Slept in a nice bedroom", 8, TICKS_PER_DAY)
+            job.inBed && indoors -> p.addThought(SLEEP_THOUGHTS, "Slept in a bedroom", 4, TICKS_PER_DAY)
+            job.inBed -> p.addThought(SLEEP_THOUGHTS, "Slept outside", -2, TICKS_PER_DAY)
+            else -> p.addThought(SLEEP_THOUGHTS, "Slept on the ground", -8, TICKS_PER_DAY)
+        }
+        if (!indoors && isCold) p.addThought("Cold night outside", -6, TICKS_PER_DAY)
     }
 
     private fun doWork(p: Pawn, job: Job) {
@@ -455,72 +657,136 @@ class Colony(
             p.job = null
             return
         }
-        job.progress += p.workSpeed
-        if (job.progress < job.type.work) return
+        val required = workRequired(job.type, t)
+        if (job.progress < required) {
+            job.progress += p.workSpeed
+            return
+        }
+        // Don't wall someone in: wait until the tile is clear.
+        if (job.type == JobType.BUILD && t.blueprint?.blocksMovement == true && pawnAt(job.x, job.y) != null) return
         p.job = null
-        when (job.type) {
+        complete(p, job.type, t)
+    }
+
+    private fun complete(p: Pawn, type: JobType, t: Tile) {
+        when (type) {
             JobType.CHOP -> {
-                val gained = if (t.feature == Feature.TREE) 6 else 1
-                wood += gained
+                add(Resource.WOOD, if (t.feature == Feature.TREE) 6 else 1)
                 t.feature = Feature.NONE
                 t.growth = 0f
             }
             JobType.MINE -> {
-                stone += 5
+                if (t.feature == Feature.ORE) {
+                    add(Resource.METAL, 3)
+                    add(Resource.STONE, 1)
+                } else {
+                    add(Resource.STONE, 5)
+                }
                 t.feature = Feature.NONE
                 t.terrain = Terrain.DIRT
+                markRoomsDirty()
             }
             JobType.PLANT_FIELD -> {
                 t.feature = Feature.FIELD
                 t.terrain = Terrain.DIRT
                 t.growth = 0f
+                if (t.crop == null) t.crop = Crop.POTATO
             }
-            JobType.BUILD_BED -> {
-                wood -= BED_WOOD
-                t.feature = Feature.BED
-            }
-            JobType.BUILD_WALL -> {
-                stone -= WALL_STONE
-                t.feature = Feature.WALL
+            JobType.BUILD -> {
+                val b = t.blueprint ?: return
+                spend(b.cost)
+                if (b.feature != null) t.feature = b.feature
+                if (b.floor != null) t.terrain = b.floor
+                t.blueprint = null
+                markRoomsDirty()
             }
             JobType.DEMOLISH -> {
-                when (t.feature) {
-                    Feature.BED -> wood += BED_WOOD / 2
-                    Feature.WALL -> stone += WALL_STONE / 2
-                    else -> {}
+                val b = Building.forFeature(t.feature)
+                when {
+                    b != null -> {
+                        refund(b)
+                        t.feature = Feature.NONE
+                    }
+                    t.feature == Feature.FIELD -> {
+                        t.feature = Feature.NONE
+                        t.crop = null
+                        t.growth = 0f
+                    }
+                    t.terrain.isFloor -> {
+                        Building.forFloor(t.terrain)?.let { refund(it) }
+                        t.terrain = Terrain.DIRT
+                    }
                 }
-                t.feature = Feature.NONE
+                markRoomsDirty()
             }
             JobType.HARVEST_FIELD -> {
-                val gained = if (p.trait == Trait.GREEN_THUMB) 7 else 5
-                food += gained
-                stats.foodHarvested += gained
+                val crop = t.crop ?: Crop.POTATO
+                var gained = crop.amount
+                if (p.trait == Trait.GREEN_THUMB) gained += (crop.amount + 1) / 2
+                add(crop.yields, gained)
+                if (crop.yields == Resource.FOOD) stats.foodHarvested += gained
                 t.growth = 0f
             }
             JobType.FORAGE -> {
                 val gained = if (p.trait == Trait.GREEN_THUMB) 4 else 3
-                food += gained
+                add(Resource.FOOD, gained)
                 stats.foodHarvested += gained
                 t.growth = 0f
             }
+            JobType.COOK -> {
+                if (this[Resource.FOOD] >= 3) {
+                    add(Resource.FOOD, -3)
+                    add(Resource.MEAL, 2)
+                }
+            }
             else -> {}
         }
-        if (t.designation == job.type) t.designation = null
+        if (t.designation == type) t.designation = null
     }
+
+    /** Demolishing returns half the materials, rounded up. */
+    private fun refund(b: Building) = b.cost.forEach { (r, n) -> add(r, (n + 1) / 2) }
 
     // ---------------------------------------------------------------- persistence
 
     fun toJson(): String = json.encodeToString(serializer(), this)
 
-    companion object {
-        const val BED_WOOD = 6
-        const val WALL_STONE = 3
+    /** Upgrades data from older save formats. */
+    private fun migrate() {
+        legacyFood?.let { stock[Resource.FOOD] = it }
+        legacyWood?.let { stock[Resource.WOOD] = it }
+        legacyStone?.let { stock[Resource.STONE] = it }
+        legacyFood = null
+        legacyWood = null
+        legacyStone = null
+        for (r in Resource.entries) stock.putIfAbsent(r, 0)
+        for (t in tiles) {
+            when (t.designation) {
+                JobType.BUILD_BED -> { t.designation = JobType.BUILD; t.blueprint = Building.BED }
+                JobType.BUILD_WALL -> { t.designation = JobType.BUILD; t.blueprint = Building.STONE_WALL }
+                else -> {}
+            }
+            if (t.feature == Feature.FIELD && t.crop == null) t.crop = Crop.POTATO
+        }
+        for (p in pawns) {
+            val type = p.job?.type
+            if (type == JobType.BUILD_BED || type == JobType.BUILD_WALL) {
+                p.job = null
+                p.path.clear()
+            }
+        }
+    }
 
-        private val json = Json { ignoreUnknownKeys = true }
+    companion object {
+        private val json = Json {
+            ignoreUnknownKeys = true
+            explicitNulls = false
+        }
 
         fun fromJson(text: String): Colony {
             val c = json.decodeFromString(serializer(), text)
             c.rng = Random(c.seed + c.tick)
+            c.migrate()
             return c
         }
     }
